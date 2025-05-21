@@ -1,14 +1,14 @@
 import os
 import logging
 from dotenv import load_dotenv
-from langchain_community.chat_models import AzureChatOpenAI, ChatOpenAI
+from langchain_openai import AzureChatOpenAI, ChatOpenAI
 from langchain.agents import initialize_agent, Tool
 from langchain.agents.agent_types import AgentType
 from prompts import graphql_prompt
 from typing import Any, Dict, Optional
 from gql import Client, gql
 from gql.transport.requests import RequestsHTTPTransport
-from pydantic import BaseModel, Field
+from langfuse_integration import trace_query, is_available as is_langfuse_available
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -16,98 +16,131 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-class GraphQLTool(Tool, BaseModel):
+class GraphQLTool:
     """Custom GraphQL Tool for LangChain"""
-    name: str = "GraphQLJobsAPI"
-    description: str = "Use this tool to query job listings from the GraphQL API."
-    endpoint: str = ""
-    headers: Dict[str, str] = {}
-    client: Any = None
     
-    class Config:
-        arbitrary_types_allowed = True
-    
-    def initialize(self):
-        """Initialize the GraphQL client"""
+    def __init__(self):
+        """Initialize the GraphQL Tool"""
         # Get GraphQL endpoint from environment
-        self.endpoint = os.getenv("GRAPHQL_ENDPOINT") or os.getenv("GRAPHQL_API_URL")
-        if not self.endpoint:
+        self._endpoint = os.getenv("GRAPHQL_ENDPOINT") or os.getenv("GRAPHQL_API_URL")
+        if not self._endpoint:
             logger.error("GRAPHQL_ENDPOINT or GRAPHQL_API_URL environment variable is required")
             raise ValueError("GRAPHQL_ENDPOINT or GRAPHQL_API_URL environment variable is required")
         
-        logger.info(f"Using GraphQL endpoint: {self.endpoint}")
+        logger.info(f"Using GraphQL endpoint: {self._endpoint}")
+        
+        # Set up headers (if any)
+        self.headers = {}
         
         # Set up GQL client
         transport = RequestsHTTPTransport(
-            url=self.endpoint,
+            url=self._endpoint,
             headers=self.headers,
+            verify=True,
+            retries=3,
         )
         
         try:
-            self.client = Client(transport=transport, fetch_schema_from_transport=True)
-            logger.info(f"Successfully connected to GraphQL endpoint: {self.endpoint}")
+            self.client = Client(transport=transport, fetch_schema_from_transport=False)
+            logger.info(f"Successfully connected to GraphQL endpoint: {self._endpoint}")
         except Exception as e:
             logger.error(f"Failed to connect to GraphQL endpoint: {e}")
             raise
     
-    def _run(self, query: str) -> str:
+    @property
+    def endpoint(self) -> str:
+        """Get the GraphQL endpoint"""
+        return self._endpoint
+    
+    def run(self, query: str) -> str:
         """Execute a GraphQL query and return the results"""
-        if self.client is None:
-            self.initialize()
-            
+        # Clean up the query string
+        query = query.replace('query:', '').strip().strip('"')
+        if query.endswith('", fetch_schema_from_transport=False'):
+            query = query[:-len('", fetch_schema_from_transport=False')]
         logger.info(f"GraphQL Query: {query}")
         
+        result = None
         try:
-            # Execute the query
-            result = self.client.execute(gql(query))
-            return str(result)
+            # Try a minimal query first to see what fields are available
+            minimal_query = """
+            query {
+                jobs {
+                    items {
+                        name
+                    }
+                }
+            }
+            """
+            try:
+                minimal_result = self.client.execute(gql(minimal_query))
+                logger.info(f"Minimal query result: {minimal_result}")
+                result = str(minimal_result)
+            except Exception as e:
+                logger.warning(f"Failed to execute minimal query: {e}")
+                # Try another field
+                minimal_query = """
+                query {
+                    jobs {
+                        items {
+                            description
+                        }
+                    }
+                }
+                """
+                try:
+                    minimal_result = self.client.execute(gql(minimal_query))
+                    logger.info(f"Minimal query result: {minimal_result}")
+                    result = str(minimal_result)
+                except Exception as e:
+                    logger.warning(f"Failed to execute second minimal query: {e}")
+            
+            # Execute the actual query if minimal queries failed
+            if not result:
+                result = str(self.client.execute(gql(query)))
+            
+            # Log to Langfuse if available
+            if is_langfuse_available():
+                trace_query("", query, result)
+                
+            return result
         except Exception as e:
+            error_msg = f"Error executing GraphQL query: {str(e)}"
             logger.error(f"GraphQL query failed: {e}")
-            return f"Error executing GraphQL query: {str(e)}"
-
-def setup_llm():
-    """Set up the LLM, with Azure as primary and OpenAI as fallback"""
-    
-    try:
-        # Try Azure OpenAI first
-        if os.getenv("AZURE_API_KEY") and os.getenv("AZURE_API_ENDPOINT"):
-            llm = AzureChatOpenAI(
-                deployment_name=os.getenv("AZURE_DEPLOYMENT_NAME", "gpt-4"),
-                openai_api_version=os.getenv("AZURE_API_VERSION", "2023-05-15"),
-                openai_api_key=os.getenv("AZURE_API_KEY"),
-                openai_api_base=os.getenv("AZURE_API_ENDPOINT"),
-                openai_api_type="azure",
-                temperature=0
-            )
-            logger.info("✅ Using Azure OpenAI.")
-            return llm
-        else:
-            logger.warning("Missing Azure OpenAI config.")
-    except Exception as e:
-        logger.warning(f"⚠️ Azure OpenAI setup failed: {e}")
-    
-    # Fallback to standard OpenAI
-    if os.getenv("OPENAI_API_KEY"):
-        logger.info("⚠️ Falling back to OpenAI")
-        return ChatOpenAI(
-            temperature=0,
-            openai_api_key=os.getenv("OPENAI_API_KEY")
-        )
-    else:
-        raise ValueError("Neither Azure OpenAI nor OpenAI API keys are available.")
+            
+            # Log error to Langfuse if available
+            if is_langfuse_available():
+                trace_query("", query, error_msg)
+                
+            return error_msg
 
 # Initialize agent when module is loaded
 try:
     # Create GraphQL tool
     graphql_tool = GraphQLTool()
-    graphql_tool.initialize()
+    
+    # Create Tool instance for LangChain
+    tool = Tool(
+        name="GraphQLJobsAPI",
+        description="Use this tool to query job listings from the GraphQL API.",
+        func=graphql_tool.run
+    )
     
     # Setup LLM
-    llm = setup_llm()
+    if os.getenv("OPENAI_API_KEY"):
+        logger.info("Using OpenAI")
+        llm = ChatOpenAI(
+            temperature=0,
+            openai_api_key=os.getenv("OPENAI_API_KEY"),
+            model_name="gpt-3.5-turbo"
+        )
+    else:
+        logger.error("No OpenAI API key provided")
+        raise ValueError("OPENAI_API_KEY environment variable is required")
     
     # Initialize agent
     agent = initialize_agent(
-        tools=[graphql_tool],
+        tools=[tool],
         llm=llm,
         agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
         verbose=True
@@ -125,7 +158,19 @@ def query_agent(question: str) -> str:
     
     try:
         logger.info(f"Processing query: {question}")
-        return agent.run(graphql_prompt.format(question=question))
+        result = agent.run(graphql_prompt.format(question=question))
+        
+        # Log to Langfuse if available
+        if is_langfuse_available():
+            trace_query(question, "", result)
+            
+        return result
     except Exception as e:
+        error_msg = f"An error occurred while processing your query: {str(e)}"
         logger.error(f"Error processing query: {e}")
-        return f"An error occurred while processing your query: {str(e)}"
+        
+        # Log error to Langfuse if available
+        if is_langfuse_available():
+            trace_query(question, "", error_msg)
+            
+        return error_msg

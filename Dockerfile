@@ -1,6 +1,11 @@
-FROM mcr.microsoft.com/azure-functions/python:4-python3.9
+FROM python:3.9-slim
 
 WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first to leverage Docker cache
 COPY requirements.txt .
@@ -12,8 +17,5 @@ COPY . .
 # Expose the port
 EXPOSE 8000
 
-# Set environment variable to disable Uvicorn access logs
-ENV UVICORN_ACCESS_LOG=false
-
 # Command to run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["python", "main.py"]
